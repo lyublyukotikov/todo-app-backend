@@ -1,6 +1,9 @@
+from time import perf_counter
+
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.cache.redis_cache import RedisCacheBackend
 from app.repositories.category import CategoryRepository
 from app.schemas.category import (
     CategoryCreateSchema,
@@ -8,20 +11,51 @@ from app.schemas.category import (
     CategoryUpdateSchema,
 )
 
-
 class CategoryService:
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        cache_redis_url: str,
+        cache_ttl_seconds: int,
+        cache_categories_key: str,
+    ) -> None:
         self.db = db
         self.category_repository = CategoryRepository(db)
+        self.cache = RedisCacheBackend(cache_redis_url, cache_ttl_seconds)
+        self.cache_categories_key = cache_categories_key
 
     def list_categories(self) -> list[CategorySchema]:
+        start_time = perf_counter()
+        cached_categories = self.cache.get(self.cache_categories_key)
+
+        if cached_categories is not None:
+            return [
+                CategorySchema.model_validate(category)
+                for category in cached_categories
+            ]
+
         categories_orm = self.category_repository.get_all()
-        return [CategorySchema.model_validate(category) for category in categories_orm]
+        categories = [
+            CategorySchema.model_validate(category)
+            for category in categories_orm
+        ]
+
+        categories_for_cache = [
+            category.model_dump(mode="json")
+            for category in categories
+        ]
+
+        self.cache.set(
+            self.cache_categories_key,
+            categories_for_cache,
+        )
+        return categories
 
     def create_category(self, category_create: CategoryCreateSchema) -> CategorySchema:
         category_orm = self.category_repository.create(name=category_create.name)
         self.db.commit()
         self.db.refresh(category_orm)
+        self.cache.delete(self.cache_categories_key)
         return CategorySchema.model_validate(category_orm)
 
     def update_category(
@@ -42,6 +76,7 @@ class CategoryService:
 
         self.db.commit()
         self.db.refresh(category_for_update)
+        self.cache.delete(self.cache_categories_key)
         return CategorySchema.model_validate(category_for_update)
 
     def delete_category(self, category_id: str) -> None:
@@ -55,3 +90,4 @@ class CategoryService:
 
         self.category_repository.delete(category_for_delete)
         self.db.commit()
+        self.cache.delete(self.cache_categories_key)
